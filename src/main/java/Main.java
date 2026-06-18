@@ -1,4 +1,5 @@
 import java.io.File;
+import java.io.FileOutputStream;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Scanner;
@@ -24,67 +25,164 @@ public class Main {
                 break;
             }
 
-            // Parse the input into arguments handling single quotes, double quotes, and backslashes
             List<String> parsedArgs = parseArguments(input);
+            if (parsedArgs.isEmpty()) {
+                continue;
+            }
+
+            String redirectFile = null;
+            String redirectErrFile = null;
+            boolean appendOut = false;
+            boolean appendErr = false;
+            int redirectIndex = -1;
+
+            for (int i = parsedArgs.size() - 2; i >= 0; i--) {
+                String arg = parsedArgs.get(i);
+                if (arg.equals(">") || arg.equals("1>")) {
+                    redirectIndex = i;
+                    redirectFile = parsedArgs.get(i + 1);
+                    appendOut = false;
+                    break;
+                } else if (arg.equals(">>") || arg.equals("1>>")) {
+                    redirectIndex = i;
+                    redirectFile = parsedArgs.get(i + 1);
+                    appendOut = true;
+                    break;
+                } else if (arg.equals("2>")) {
+                    redirectIndex = i;
+                    redirectErrFile = parsedArgs.get(i + 1);
+                    appendErr = false;
+                    break;
+                } else if (arg.equals("2>>")) {
+                    redirectIndex = i;
+                    redirectErrFile = parsedArgs.get(i + 1);
+                    appendErr = true;
+                    break;
+                }
+            }
+
+            if (redirectIndex != -1) {
+                parsedArgs.remove(redirectIndex + 1);
+                parsedArgs.remove(redirectIndex);
+            }
+
             if (parsedArgs.isEmpty()) {
                 continue;
             }
 
             String cmd = parsedArgs.get(0);
 
-            if (cmd.equals("pwd")) {
-                System.out.println(System.getProperty("user.dir"));
-                continue;
-            }
+            java.io.PrintStream originalOut = System.out;
+            java.io.PrintStream originalErr = System.err;
+            java.io.PrintStream fileOut = null;
+            java.io.PrintStream fileErr = null;
 
-            if (cmd.equals("cd")) {
-                String path = parsedArgs.size() > 1 ? parsedArgs.get(1) : "~";
-                File target;
-
-                if (path.equals("~")) {
-                    String home = System.getenv("HOME");
-                    target = new File(home);
-                } else if (path.startsWith("/")) {
-                    target = new File(path);
-                } else {
-                    File current = new File(System.getProperty("user.dir"));
-                    target = new File(current, path);
-                }
-
+            if (redirectFile != null) {
                 try {
-                    File resolved = new File(target.getCanonicalPath());
-
-                    if (resolved.isDirectory()) {
-                        System.setProperty("user.dir", resolved.getAbsolutePath());
-                    } else {
-                        System.out.println("cd: " + path + ": No such file or directory");
+                    File outFile = new File(redirectFile);
+                    if (outFile.getParentFile() != null) {
+                        outFile.getParentFile().mkdirs();
                     }
-
+                    fileOut = new java.io.PrintStream(new FileOutputStream(outFile, appendOut));
+                    System.setOut(fileOut);
                 } catch (Exception e) {
-                    System.out.println("cd: " + path + ": No such file or directory");
+                    System.err.println("Shell error: Cannot write to file " + redirectFile);
+                    continue;
                 }
-
-                continue;
             }
 
-            if (cmd.equals("echo")) {
-                // Join all parsed arguments after 'echo' with a single space
-                StringBuilder sb = new StringBuilder();
-                for (int i = 1; i < parsedArgs.size(); i++) {
-                    sb.append(parsedArgs.get(i));
-                    if (i < parsedArgs.size() - 1) {
-                        sb.append(" ");
+            if (redirectErrFile != null) {
+                try {
+                    File errFile = new File(redirectErrFile);
+                    if (errFile.getParentFile() != null) {
+                        errFile.getParentFile().mkdirs();
                     }
+                    fileErr = new java.io.PrintStream(new FileOutputStream(errFile, appendErr));
+                    System.setErr(fileErr);
+                } catch (Exception e) {
+                    System.err.println("Shell error: Cannot write to file " + redirectErrFile);
+                    continue;
                 }
-                System.out.println(sb.toString());
-                continue;
             }
 
-            if (cmd.equals("type")) {
-                String targetCmd = parsedArgs.size() > 1 ? parsedArgs.get(1) : "";
+            try {
+                if (cmd.equals("pwd")) {
+                    System.out.println(System.getProperty("user.dir"));
+                    continue;
+                }
 
-                if (targetCmd.equals("echo") || targetCmd.equals("exit") || targetCmd.equals("type") || targetCmd.equals("pwd") || targetCmd.equals("cd")) {
-                    System.out.println(targetCmd + " is a shell builtin");
+                if (cmd.equals("cd")) {
+                    String path = parsedArgs.size() > 1 ? parsedArgs.get(1) : "~";
+                    File target;
+
+                    if (path.equals("~")) {
+                        String home = System.getenv("HOME");
+                        target = new File(home);
+                    } else if (path.startsWith("/")) {
+                        target = new File(path);
+                    } else {
+                        File current = new File(System.getProperty("user.dir"));
+                        target = new File(current, path);
+                    }
+
+                    try {
+                        File resolved = new File(target.getCanonicalPath());
+
+                        if (resolved.isDirectory()) {
+                            System.setProperty("user.dir", resolved.getAbsolutePath());
+                        } else {
+                            System.err.println("cd: " + path + ": No such file or directory");
+                        }
+
+                    } catch (Exception e) {
+                        System.err.println("cd: " + path + ": No such file or directory");
+                    }
+
+                    continue;
+                }
+
+                if (cmd.equals("echo")) {
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 1; i < parsedArgs.size(); i++) {
+                        sb.append(parsedArgs.get(i));
+                        if (i < parsedArgs.size() - 1) {
+                            sb.append(" ");
+                        }
+                    }
+                    System.out.println(sb.toString());
+                    continue;
+                }
+
+                if (cmd.equals("type")) {
+                    String targetCmd = parsedArgs.size() > 1 ? parsedArgs.get(1) : "";
+
+                    if (targetCmd.equals("echo") || targetCmd.equals("exit") || targetCmd.equals("type") || targetCmd.equals("pwd") || targetCmd.equals("cd")) {
+                        System.out.println(targetCmd + " is a shell builtin");
+                        continue;
+                    }
+
+                    String pathEnv = System.getenv("PATH");
+                    String found = null;
+
+                    if (pathEnv != null) {
+                        String[] paths = pathEnv.split(File.pathSeparator);
+
+                        for (String dir : paths) {
+                            File file = new File(dir, targetCmd);
+
+                            if (file.exists() && file.canExecute()) {
+                                found = file.getAbsolutePath();
+                                break;
+                            }
+                        }
+                    }
+
+                    if (found != null) {
+                        System.out.println(targetCmd + " is " + found);
+                    } else {
+                        System.err.println(targetCmd + ": not found");
+                    }
+
                     continue;
                 }
 
@@ -95,7 +193,7 @@ public class Main {
                     String[] paths = pathEnv.split(File.pathSeparator);
 
                     for (String dir : paths) {
-                        File file = new File(dir, targetCmd);
+                        File file = new File(dir, cmd);
 
                         if (file.exists() && file.canExecute()) {
                             found = file.getAbsolutePath();
@@ -104,57 +202,60 @@ public class Main {
                     }
                 }
 
-                if (found != null) {
-                    System.out.println(targetCmd + " is " + found);
-                } else {
-                    System.out.println(targetCmd + ": not found");
+                if (found == null) {
+                    System.err.println(cmd + ": command not found");
+                    continue;
                 }
 
-                continue;
-            }
+                try {
+                    ProcessBuilder pb = new ProcessBuilder(parsedArgs);
 
-            // External Command handling (e.g., cat)
-            String pathEnv = System.getenv("PATH");
-            String found = null;
-
-            if (pathEnv != null) {
-                String[] paths = pathEnv.split(File.pathSeparator);
-
-                for (String dir : paths) {
-                    File file = new File(dir, cmd);
-
-                    if (file.exists() && file.canExecute()) {
-                        found = file.getAbsolutePath();
-                        break;
+                    if (redirectFile != null) {
+                        if (appendOut) {
+                            pb.redirectOutput(ProcessBuilder.Redirect.appendTo(new File(redirectFile)));
+                        } else {
+                            pb.redirectOutput(new File(redirectFile));
+                        }
+                    } else {
+                        pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
                     }
+
+                    if (redirectErrFile != null) {
+                        if (appendErr) {
+                            pb.redirectError(ProcessBuilder.Redirect.appendTo(new File(redirectErrFile)));
+                        } else {
+                            pb.redirectError(new File(redirectErrFile));
+                        }
+                    } else {
+                        pb.redirectError(ProcessBuilder.Redirect.INHERIT);
+                    }
+
+                    pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
+
+                    Process process = pb.start();
+                    process.waitFor();
+
+                } catch (Exception e) {
+                    System.err.println("Error executing command");
                 }
-            }
 
-            if (found == null) {
-                System.out.println(cmd + ": command not found");
-                continue;
-            }
-
-            try {
-                ProcessBuilder pb = new ProcessBuilder(parsedArgs);
-                pb.inheritIO();
-
-                Process process = pb.start();
-                process.waitFor();
+            } finally {
+                if (fileOut != null) {
+                    fileOut.close();
+                    System.setOut(originalOut);
+                }
+                if (fileErr != null) {
+                    fileErr.close();
+                    System.setErr(originalErr);
+                }
                 System.out.flush();
-
-            } catch (Exception e) {
-                System.out.println("Error executing command");
+                System.err.flush();
             }
         }
 
         scanner.close();
     }
 
-    /**
-     * Parses the command line input into a list of arguments.
-     * Implements conditional backslash escaping inside double quotes.
-     */
     private static List<String> parseArguments(String input) {
         List<String> tokens = new ArrayList<>();
         StringBuilder currentToken = new StringBuilder();
@@ -165,7 +266,6 @@ public class Main {
         for (int i = 0; i < input.length(); i++) {
             char c = input.charAt(i);
 
-            // 1. Handle backslash outside of ALL quotes
             if (c == '\\' && !inSingleQuotes && !inDoubleQuotes) {
                 if (i + 1 < input.length()) {
                     currentToken.append(input.charAt(i + 1));
@@ -176,16 +276,13 @@ public class Main {
                     contentAdded = true;
                 }
             }
-            // 2. Handle backslash INSIDE double quotes (Selective Escaping)
             else if (c == '\\' && inDoubleQuotes) {
                 if (i + 1 < input.length()) {
                     char next = input.charAt(i + 1);
                     if (next == '"' || next == '\\' || next == '$' || next == '`') {
-                        // It's a special character! Drop the backslash, keep the literal next character
                         currentToken.append(next);
                         i++;
                     } else {
-                        // Not a special character! Treat the backslash literally
                         currentToken.append(c);
                     }
                     contentAdded = true;
@@ -194,21 +291,17 @@ public class Main {
                     contentAdded = true;
                 }
             }
-            // 3. Toggle single quotes (only if not in double quotes)
             else if (c == '\'' && !inDoubleQuotes) {
                 inSingleQuotes = !inSingleQuotes;
                 contentAdded = true;
             }
-            // 4. Toggle double quotes (only if not in single quotes)
             else if (c == '"' && !inSingleQuotes) {
                 inDoubleQuotes = !inDoubleQuotes;
                 contentAdded = true;
             }
-            // 5. Characters inside active single or double quotes are added directly
             else if (inSingleQuotes || inDoubleQuotes) {
                 currentToken.append(c);
             }
-            // 6. Normal characters outside of quotes
             else {
                 if (Character.isWhitespace(c)) {
                     if (currentToken.length() > 0 || contentAdded) {
