@@ -6,9 +6,26 @@ import java.util.Scanner;
 
 public class Main {
 
+    static class Job {
+        int id;
+        long pid;
+        String command;
+        String status;
+        Process process;
+
+        Job(int id, long pid, String command, String status, Process process) {
+            this.id = id;
+            this.pid = pid;
+            this.command = command;
+            this.status = status;
+            this.process = process;
+        }
+    }
+
     public static void main(String[] args) {
 
         Scanner scanner = new Scanner(System.in);
+        List<Job> activeJobs = new ArrayList<>();
 
         while (true) {
 
@@ -18,6 +35,7 @@ public class Main {
             String input = scanner.nextLine().trim();
 
             if (input.isEmpty()) {
+                reapJobsBeforePrompt(activeJobs);
                 continue;
             }
 
@@ -27,8 +45,22 @@ public class Main {
 
             List<String> parsedArgs = parseArguments(input);
             if (parsedArgs.isEmpty()) {
+                reapJobsBeforePrompt(activeJobs);
                 continue;
             }
+
+            boolean isBackground = false;
+            if (parsedArgs.get(parsedArgs.size() - 1).equals("&")) {
+                isBackground = true;
+                parsedArgs.remove(parsedArgs.size() - 1);
+            }
+
+            if (parsedArgs.isEmpty()) {
+                reapJobsBeforePrompt(activeJobs);
+                continue;
+            }
+
+            String cmd = parsedArgs.get(0);
 
             String redirectFile = null;
             String redirectErrFile = null;
@@ -67,10 +99,11 @@ public class Main {
             }
 
             if (parsedArgs.isEmpty()) {
+                if (!cmd.equals("jobs")) {
+                    reapJobsBeforePrompt(activeJobs);
+                }
                 continue;
             }
-
-            String cmd = parsedArgs.get(0);
 
             java.io.PrintStream originalOut = System.out;
             java.io.PrintStream originalErr = System.err;
@@ -87,6 +120,9 @@ public class Main {
                     System.setOut(fileOut);
                 } catch (Exception e) {
                     System.err.println("Shell error: Cannot write to file " + redirectFile);
+                    if (!cmd.equals("jobs")) {
+                        reapJobsBeforePrompt(activeJobs);
+                    }
                     continue;
                 }
             }
@@ -101,11 +137,50 @@ public class Main {
                     System.setErr(fileErr);
                 } catch (Exception e) {
                     System.err.println("Shell error: Cannot write to file " + redirectErrFile);
+                    if (fileOut != null) fileOut.close();
+                    System.setOut(originalOut);
+                    if (!cmd.equals("jobs")) {
+                        reapJobsBeforePrompt(activeJobs);
+                    }
                     continue;
                 }
             }
 
             try {
+                if (cmd.equals("jobs")) {
+                    int size = activeJobs.size();
+                    for (int i = 0; i < size; i++) {
+                        Job job = activeJobs.get(i);
+                        if (!job.process.isAlive()) {
+                            job.status = "Done";
+                        }
+                    }
+
+                    List<Job> toRemove = new ArrayList<>();
+                    for (int i = 0; i < size; i++) {
+                        Job job = activeJobs.get(i);
+                        char marker = ' ';
+                        if (i == size - 1) {
+                            marker = '+';
+                        } else if (i == size - 2) {
+                            marker = '-';
+                        }
+
+                        String displayCmd = job.command;
+                        if (job.status.equals("Done") && displayCmd.endsWith(" &")) {
+                            displayCmd = displayCmd.substring(0, displayCmd.length() - 2);
+                        }
+
+                        System.out.printf("[%d]%c  %-24s%s\n", job.id, marker, job.status, displayCmd);
+
+                        if (job.status.equals("Done")) {
+                            toRemove.add(job);
+                        }
+                    }
+                    activeJobs.removeAll(toRemove);
+                    continue;
+                }
+
                 if (cmd.equals("pwd")) {
                     System.out.println(System.getProperty("user.dir"));
                     continue;
@@ -156,7 +231,7 @@ public class Main {
                 if (cmd.equals("type")) {
                     String targetCmd = parsedArgs.size() > 1 ? parsedArgs.get(1) : "";
 
-                    if (targetCmd.equals("echo") || targetCmd.equals("exit") || targetCmd.equals("type") || targetCmd.equals("pwd") || targetCmd.equals("cd")) {
+                    if (targetCmd.equals("echo") || targetCmd.equals("exit") || targetCmd.equals("type") || targetCmd.equals("pwd") || targetCmd.equals("cd") || targetCmd.equals("jobs")) {
                         System.out.println(targetCmd + " is a shell builtin");
                         continue;
                     }
@@ -233,7 +308,35 @@ public class Main {
                     pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
 
                     Process process = pb.start();
-                    process.waitFor();
+
+                    if (isBackground) {
+                        int assignedJobId = 1;
+                        while (true) {
+                            boolean idTaken = false;
+                            for (Job job : activeJobs) {
+                                if (job.id == assignedJobId) {
+                                    idTaken = true;
+                                    break;
+                                }
+                            }
+                            if (!idTaken) {
+                                break;
+                            }
+                            assignedJobId++;
+                        }
+
+                        long pid = process.pid();
+                        originalOut.println("[" + assignedJobId + "] " + pid);
+                        String rawCommand = input;
+
+                        int insertionIndex = 0;
+                        while (insertionIndex < activeJobs.size() && activeJobs.get(insertionIndex).id < assignedJobId) {
+                            insertionIndex++;
+                        }
+                        activeJobs.add(insertionIndex, new Job(assignedJobId, pid, rawCommand, "Running", process));
+                    } else {
+                        process.waitFor();
+                    }
 
                 } catch (Exception e) {
                     System.err.println("Error executing command");
@@ -250,10 +353,38 @@ public class Main {
                 }
                 System.out.flush();
                 System.err.flush();
+
+                if (!cmd.equals("jobs")) {
+                    reapJobsBeforePrompt(activeJobs);
+                }
             }
         }
+    }
 
-        scanner.close();
+    private static void reapJobsBeforePrompt(List<Job> activeJobs) {
+        int size = activeJobs.size();
+        List<Job> toRemove = new ArrayList<>();
+
+        for (int i = 0; i < size; i++) {
+            Job job = activeJobs.get(i);
+            char marker = ' ';
+            if (i == size - 1) {
+                marker = '+';
+            } else if (i == size - 2) {
+                marker = '-';
+            }
+
+            if (!job.process.isAlive() && job.status.equals("Running")) {
+                job.status = "Done";
+                String displayCmd = job.command;
+                if (displayCmd.endsWith(" &")) {
+                    displayCmd = displayCmd.substring(0, displayCmd.length() - 2);
+                }
+                System.out.printf("[%d]%c  %-24s%s\n", job.id, marker, job.status, displayCmd);
+                toRemove.add(job);
+            }
+        }
+        activeJobs.removeAll(toRemove);
     }
 
     private static List<String> parseArguments(String input) {
