@@ -62,6 +62,172 @@ public class Main {
 
             String cmd = parsedArgs.get(0);
 
+            // Check for any pipeline characters
+            boolean hasPipeline = false;
+            for (String arg : parsedArgs) {
+                if (arg.equals("|")) {
+                    hasPipeline = true;
+                    break;
+                }
+            }
+
+            if (hasPipeline) {
+                try {
+                    // Group arguments into individual command stages split by "|"
+                    List<List<String>> stages = new ArrayList<>();
+                    List<String> currentStage = new ArrayList<>();
+                    for (String arg : parsedArgs) {
+                        if (arg.equals("|")) {
+                            stages.add(currentStage);
+                            currentStage = new ArrayList<>();
+                        } else {
+                            currentStage.add(arg);
+                        }
+                    }
+                    stages.add(currentStage);
+
+                    java.io.InputStream currentIn = System.in;
+                    java.io.PrintStream originalOut = System.out;
+                    java.io.InputStream originalIn = System.in;
+
+                    List<Thread> activeThreads = new ArrayList<>();
+                    Process lastProcess = null;
+
+                    // Iterate and chain each parsed command segment
+                    for (int i = 0; i < stages.size(); i++) {
+                        List<String> stageArgs = stages.get(i);
+                        boolean isLastStage = (i == stages.size() - 1);
+
+                        java.io.PipedOutputStream stageOut = null;
+                        java.io.PipedInputStream nextIn = null;
+
+                        if (!isLastStage) {
+                            stageOut = new java.io.PipedOutputStream();
+                            nextIn = new java.io.PipedInputStream(stageOut);
+                        }
+
+                        final java.io.InputStream stageInputChannel = currentIn;
+                        final java.io.PipedOutputStream stageOutputChannel = stageOut;
+
+                        if (isBuiltin(stageArgs.get(0))) {
+                            Thread builtinThread = new Thread(() -> {
+                                try {
+                                    if (stageInputChannel != System.in) {
+                                        System.setIn(stageInputChannel);
+                                    }
+                                    if (!isLastStage) {
+                                        java.io.PrintStream tempOut = new java.io.PrintStream(stageOutputChannel, true);
+                                        System.setOut(tempOut);
+                                    } else {
+                                        System.setOut(originalOut);
+                                    }
+                                    executeBuiltin(stageArgs.get(0), stageArgs, activeJobs);
+                                } catch (Exception e) {
+                                } finally {
+                                    try { if (stageOutputChannel != null) stageOutputChannel.close(); } catch (Exception e) {}
+                                    try { if (stageInputChannel != System.in) stageInputChannel.close(); } catch (Exception e) {}
+                                }
+                            });
+                            activeThreads.add(builtinThread);
+                            builtinThread.start();
+                        } else {
+                            // External Binary execution processing
+                            ProcessBuilder pb = new ProcessBuilder(stageArgs);
+                            if (stageInputChannel == System.in) {
+                                pb.redirectInput(ProcessBuilder.Redirect.INHERIT);
+                            }
+                            if (isLastStage) {
+                                pb.redirectOutput(ProcessBuilder.Redirect.INHERIT);
+                            }
+                            pb.redirectError(ProcessBuilder.Redirect.INHERIT);
+
+                            Process p = pb.start();
+                            if (isLastStage) {
+                                lastProcess = p;
+                            }
+
+                            // Thread responsible for shifting data down to standard process streams
+                            if (stageInputChannel != System.in) {
+                                Thread inputFeeder = new Thread(() -> {
+                                    try (java.io.OutputStream pOut = p.getOutputStream();
+                                         java.io.InputStream sourceIn = stageInputChannel) {
+                                        byte[] buffer = new byte[4096];
+                                        int read;
+                                        while ((read = sourceIn.read(buffer)) != -1) {
+                                            pOut.write(buffer, 0, read);
+                                            pOut.flush();
+                                        }
+                                    } catch (Exception e) {}
+                                });
+                                activeThreads.add(inputFeeder);
+                                inputFeeder.start();
+                            }
+
+                            // Thread responsible for lifting output data out to downstream buffers
+                            if (!isLastStage) {
+                                Thread outputExtractor = new Thread(() -> {
+                                    try (java.io.InputStream pIn = p.getInputStream();
+                                         java.io.PipedOutputStream targetOut = stageOutputChannel) {
+                                        byte[] buffer = new byte[4096];
+                                        int read;
+                                        while ((read = pIn.read(buffer)) != -1) {
+                                            targetOut.write(buffer, 0, read);
+                                            targetOut.flush();
+                                        }
+                                    } catch (Exception e) {}
+                                });
+                                activeThreads.add(outputExtractor);
+                                outputExtractor.start();
+                            }
+                        }
+
+                        currentIn = nextIn;
+                    }
+
+                    // Reset default global environmental channels safe keeping hooks
+                    System.setIn(originalIn);
+                    System.setOut(originalOut);
+
+                    if (isBackground && lastProcess != null) {
+                        int assignedJobId = 1;
+                        while (true) {
+                            boolean idTaken = false;
+                            for (Job job : activeJobs) {
+                                if (job.id == assignedJobId) {
+                                    idTaken = true;
+                                    break;
+                                }
+                            }
+                            if (!idTaken) {
+                                break;
+                            }
+                            assignedJobId++;
+                        }
+                        System.out.println("[" + assignedJobId + "] " + lastProcess.pid());
+                        int insertionIndex = 0;
+                        while (insertionIndex < activeJobs.size() && activeJobs.get(insertionIndex).id < assignedJobId) {
+                            insertionIndex++;
+                        }
+                        activeJobs.add(insertionIndex, new Job(assignedJobId, lastProcess.pid(), input, "Running", lastProcess));
+                    } else {
+                        if (lastProcess != null) {
+                            lastProcess.waitFor();
+                        }
+                        for (Thread t : activeThreads) {
+                            t.join();
+                        }
+                    }
+
+                } catch (Exception e) {
+                    System.err.println("Error executing multi-stage pipeline");
+                }
+
+                if (!cmd.equals("jobs")) {
+                    reapJobsBeforePrompt(activeJobs);
+                }
+                continue;
+            }
+
             String redirectFile = null;
             String redirectErrFile = null;
             boolean appendOut = false;
@@ -147,117 +313,8 @@ public class Main {
             }
 
             try {
-                if (cmd.equals("jobs")) {
-                    int size = activeJobs.size();
-                    for (int i = 0; i < size; i++) {
-                        Job job = activeJobs.get(i);
-                        if (!job.process.isAlive()) {
-                            job.status = "Done";
-                        }
-                    }
-
-                    List<Job> toRemove = new ArrayList<>();
-                    for (int i = 0; i < size; i++) {
-                        Job job = activeJobs.get(i);
-                        char marker = ' ';
-                        if (i == size - 1) {
-                            marker = '+';
-                        } else if (i == size - 2) {
-                            marker = '-';
-                        }
-
-                        String displayCmd = job.command;
-                        if (job.status.equals("Done") && displayCmd.endsWith(" &")) {
-                            displayCmd = displayCmd.substring(0, displayCmd.length() - 2);
-                        }
-
-                        System.out.printf("[%d]%c  %-24s%s\n", job.id, marker, job.status, displayCmd);
-
-                        if (job.status.equals("Done")) {
-                            toRemove.add(job);
-                        }
-                    }
-                    activeJobs.removeAll(toRemove);
-                    continue;
-                }
-
-                if (cmd.equals("pwd")) {
-                    System.out.println(System.getProperty("user.dir"));
-                    continue;
-                }
-
-                if (cmd.equals("cd")) {
-                    String path = parsedArgs.size() > 1 ? parsedArgs.get(1) : "~";
-                    File target;
-
-                    if (path.equals("~")) {
-                        String home = System.getenv("HOME");
-                        target = new File(home);
-                    } else if (path.startsWith("/")) {
-                        target = new File(path);
-                    } else {
-                        File current = new File(System.getProperty("user.dir"));
-                        target = new File(current, path);
-                    }
-
-                    try {
-                        File resolved = new File(target.getCanonicalPath());
-
-                        if (resolved.isDirectory()) {
-                            System.setProperty("user.dir", resolved.getAbsolutePath());
-                        } else {
-                            System.err.println("cd: " + path + ": No such file or directory");
-                        }
-
-                    } catch (Exception e) {
-                        System.err.println("cd: " + path + ": No such file or directory");
-                    }
-
-                    continue;
-                }
-
-                if (cmd.equals("echo")) {
-                    StringBuilder sb = new StringBuilder();
-                    for (int i = 1; i < parsedArgs.size(); i++) {
-                        sb.append(parsedArgs.get(i));
-                        if (i < parsedArgs.size() - 1) {
-                            sb.append(" ");
-                        }
-                    }
-                    System.out.println(sb.toString());
-                    continue;
-                }
-
-                if (cmd.equals("type")) {
-                    String targetCmd = parsedArgs.size() > 1 ? parsedArgs.get(1) : "";
-
-                    if (targetCmd.equals("echo") || targetCmd.equals("exit") || targetCmd.equals("type") || targetCmd.equals("pwd") || targetCmd.equals("cd") || targetCmd.equals("jobs")) {
-                        System.out.println(targetCmd + " is a shell builtin");
-                        continue;
-                    }
-
-                    String pathEnv = System.getenv("PATH");
-                    String found = null;
-
-                    if (pathEnv != null) {
-                        String[] paths = pathEnv.split(File.pathSeparator);
-
-                        for (String dir : paths) {
-                            File file = new File(dir, targetCmd);
-
-                            if (file.exists() && file.canExecute()) {
-                                found = file.getAbsolutePath();
-                                break;
-                            }
-                        }
-                    }
-
-                    if (found != null) {
-                        System.out.println(targetCmd + " is " + found);
-                    } else {
-                        System.err.println(targetCmd + ": not found");
-                    }
-
+                if (isBuiltin(cmd)) {
+                    executeBuiltin(cmd, parsedArgs, activeJobs);
                     continue;
                 }
 
@@ -356,6 +413,103 @@ public class Main {
 
                 if (!cmd.equals("jobs")) {
                     reapJobsBeforePrompt(activeJobs);
+                }
+            }
+        }
+    }
+
+    private static boolean isBuiltin(String cmd) {
+        return cmd.equals("echo") || cmd.equals("exit") || cmd.equals("type") || cmd.equals("pwd") || cmd.equals("cd") || cmd.equals("jobs");
+    }
+
+    private static void executeBuiltin(String cmd, List<String> args, List<Job> activeJobs) {
+        if (cmd.equals("jobs")) {
+            int size = activeJobs.size();
+            for (int i = 0; i < size; i++) {
+                Job job = activeJobs.get(i);
+                if (!job.process.isAlive()) {
+                    job.status = "Done";
+                }
+            }
+
+            List<Job> toRemove = new ArrayList<>();
+            for (int i = 0; i < size; i++) {
+                Job job = activeJobs.get(i);
+                char marker = ' ';
+                if (i == size - 1) {
+                    marker = '+';
+                } else if (i == size - 2) {
+                    marker = '-';
+                }
+
+                String displayCmd = job.command;
+                if (job.status.equals("Done") && displayCmd.endsWith(" &")) {
+                    displayCmd = displayCmd.substring(0, displayCmd.length() - 2);
+                }
+
+                System.out.printf("[%d]%c  %-24s%s\n", job.id, marker, job.status, displayCmd);
+
+                if (job.status.equals("Done")) {
+                    toRemove.add(job);
+                }
+            }
+            activeJobs.removeAll(toRemove);
+        } else if (cmd.equals("pwd")) {
+            System.out.println(System.getProperty("user.dir"));
+        } else if (cmd.equals("cd")) {
+            String path = args.size() > 1 ? args.get(1) : "~";
+            File target;
+
+            if (path.equals("~")) {
+                String home = System.getenv("HOME");
+                target = new File(home);
+            } else if (path.startsWith("/")) {
+                target = new File(path);
+            } else {
+                File current = new File(System.getProperty("user.dir"));
+                target = new File(current, path);
+            }
+
+            try {
+                File resolved = new File(target.getCanonicalPath());
+                if (resolved.isDirectory()) {
+                    System.setProperty("user.dir", resolved.getAbsolutePath());
+                } else {
+                    System.err.println("cd: " + path + ": No such file or directory");
+                }
+            } catch (Exception e) {
+                System.err.println("cd: " + path + ": No such file or directory");
+            }
+        } else if (cmd.equals("echo")) {
+            StringBuilder sb = new StringBuilder();
+            for (int i = 1; i < args.size(); i++) {
+                sb.append(args.get(i));
+                if (i < args.size() - 1) {
+                    sb.append(" ");
+                }
+            }
+            System.out.println(sb.toString());
+        } else if (cmd.equals("type")) {
+            String targetCmd = args.size() > 1 ? args.get(1) : "";
+            if (isBuiltin(targetCmd)) {
+                System.out.println(targetCmd + " is a shell builtin");
+            } else {
+                String pathEnv = System.getenv("PATH");
+                String found = null;
+                if (pathEnv != null) {
+                    String[] paths = pathEnv.split(File.pathSeparator);
+                    for (String dir : paths) {
+                        File file = new File(dir, targetCmd);
+                        if (file.exists() && file.canExecute()) {
+                            found = file.getAbsolutePath();
+                            break;
+                        }
+                    }
+                }
+                if (found != null) {
+                    System.out.println(targetCmd + " is " + found);
+                } else {
+                    System.err.println(targetCmd + ": not found");
                 }
             }
         }
